@@ -9,4 +9,29 @@ While traditional GNN models with 1-hop edges (i.e., covalent bonds) are suffici
 Through our experiments, MetaGIN achieves a mean absolute error (MAE) of 0.0851 with just 8.87M parameters on the PCQM4Mv2 dataset. Furthermore, MetaGIN outperforms leading techniques, showcasing superior performance across several datasets in the MoleculeNet benchmark.
 
 
+## Usage
 
+### Installation
+
+To install MetaGIN, clone the repository and install the required packages:
+
+```bash
+conda create -n metagin python=3.10
+conda activate metagin
+conda install -y pytorch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 pytorch-cuda=12.1 -c pytorch -c nvidia
+conda install -y pyg pytorch-scatter pytorch-sparse -c pyg
+conda install -y ogb rdkit h5py
+```
+
+
+### Download the checkpoint
+
+```bash
+wget https://zenodo.org/records/13147277/files/metagin_wide.pt
+```
+
+### Using the model
+
+```bash
+python src/predict.py --model wide31 --checkpoint metagin_wide.pt --smiles_file smiles.txt
+```

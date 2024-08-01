@@ -22,8 +22,83 @@ from ogb.lsc import PCQM4Mv2Evaluator
 from torch_sparse import coalesce, spspmm
 from torch_geometric.utils import degree
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
-from torch_geometric.transforms import AddRandomWalkPE
+# from torch_geometric.transforms import AddRandomWalkPE
 from torch_geometric.loader import DataLoader
+
+
+from typing import Any, Optional
+
+import numpy as np
+import torch
+from torch_sparse import SparseTensor
+
+from torch_geometric.data import Data
+from torch_geometric.data.datapipes import functional_transform
+from torch_geometric.transforms import BaseTransform
+from torch_geometric.utils import (
+    get_laplacian,
+    get_self_loop_attr,
+    to_scipy_sparse_matrix,
+)
+
+def add_node_attr(data: Data, value: Any,
+                  attr_name: Optional[str] = None) -> Data:
+    # TODO Move to `BaseTransform`.
+    if attr_name is None:
+        if 'x' in data:
+            x = data.x.view(-1, 1) if data.x.dim() == 1 else data.x
+            data.x = torch.cat([x, value.to(x.device, x.dtype)], dim=-1)
+        else:
+            data.x = value
+    else:
+        data[attr_name] = value
+
+    return data
+
+# @functional_transform('add_random_walk_pe')
+class AddRandomWalkPE(BaseTransform):
+    r"""Adds the random walk positional encoding from the `"Graph Neural
+    Networks with Learnable Structural and Positional Representations"
+    <https://arxiv.org/abs/2110.07875>`_ paper to the given graph
+    (functional name: :obj:`add_random_walk_pe`).
+    Args:
+        walk_length (int): The number of random walk steps.
+        attr_name (str, optional): The attribute name of the data object to add
+            positional encodings to. If set to :obj:`None`, will be
+            concatenated to :obj:`data.x`.
+            (default: :obj:`"laplacian_eigenvector_pe"`)
+    """
+    def __init__(
+        self,
+        walk_length: int,
+        attr_name: Optional[str] = 'random_walk_pe',
+    ):
+        self.walk_length = walk_length
+        self.attr_name = attr_name
+
+    def __call__(self, data: Data) -> Data:
+        num_nodes = data.num_nodes
+        edge_index, edge_weight = data.edge_index, data.edge_weight
+
+        adj = SparseTensor.from_edge_index(edge_index, edge_weight,
+                                           sparse_sizes=(num_nodes, num_nodes))
+
+        # Compute D^{-1} A:
+        deg_inv = 1.0 / adj.sum(dim=1)
+        deg_inv[deg_inv == float('inf')] = 0
+        adj = adj * deg_inv.view(-1, 1)
+
+        out = adj
+        row, col, value = out.coo()
+        pe_list = [get_self_loop_attr((row, col), value, num_nodes)]
+        for _ in range(self.walk_length - 1):
+            out = out @ adj
+            row, col, value = out.coo()
+            pe_list.append(get_self_loop_attr((row, col), value, num_nodes))
+        pe = torch.stack(pe_list, dim=-1)
+
+        data = add_node_attr(data, pe, attr_name=self.attr_name)
+        return data
 
 
 ATOM_SIZE = [36, 4, 12, 12, 10, 6, 6, 3]
@@ -350,7 +425,7 @@ class PygPCQM4Mv2Dataset(InMemoryDataset):
             data.edge_weight = pt.from_numpy(i2w[graph['edge_feat'][:, 0]]).float()
             data.x = pt.from_numpy(graph['node_feat']).int()
             data.pos_3d = pt.from_numpy(graph['node_pos3d']).float()
-            addPosRW(data)
+            data = addPosRW(data)
             data.y = pt.Tensor([homolumogap]).float()
             if self.pre_transform is not None:
                 data = self.pre_transform(data)
@@ -380,10 +455,154 @@ class PygPCQM4Mv2Dataset(InMemoryDataset):
 
 addPosRW = AddRandomWalkPE(16, 'pos_rw')
 params   = Chem.SmilesParserParams(); params.removeHs = True  # hydrogen
-dataset  = PygPCQM4Mv2Dataset(root='data', pre_transform=hetero_transform, transform=cast_transform)
-dataidx  = dataset.get_idx_split()
-dataeval = PCQM4Mv2Evaluator()
 
+# dataset  = PygPCQM4Mv2Dataset(root='data', pre_transform=hetero_transform, transform=cast_transform)
+# dataidx  = dataset.get_idx_split()
+# dataeval = PCQM4Mv2Evaluator()
+
+class SmilesPCQM4Mv2Dataset(InMemoryDataset):
+    def __init__(self, smiles_list, homo_list=None, root='data', transform=None, pre_transform=None, pre_filter=None):
+        '''
+            Pytorch Geometric PCQM4Mv2 dataset object
+                - root (str): the dataset folder will be located at root/pcqm4m_kddcup2021
+        '''
+
+        self.original_root = root
+        self.folder = osp.join(root, 'pcqm4m-metagin-temp')
+        self.version = 1
+        self.smiles_list = smiles_list
+        self.homo_list = homo_list
+
+
+        super(InMemoryDataset, self).__init__(self.folder, transform, pre_transform)
+
+        self.data, self.slices = pt.load(self.processed_paths[0])
+
+        os.remove(self.processed_paths[0])
+
+    @property
+    def raw_file_names(self):
+        return 'data.csv.gz'
+
+    @property
+    def processed_file_names(self):
+        return 'geometric_data_processed.pt'
+
+    def download(self):
+        pass
+
+    def molecule2graph(self, mol):
+        # atoms
+        atom_features_list = []
+        for atom in mol.GetAtoms():
+            v = atom_to_feature_vector(atom)
+            v = v[:1] + [0] + v[2:7] + [v[7]+v[8]]
+            atom_features_list.append(v)
+        for idx, chi in Chem.FindMolChiralCenters(mol, includeUnassigned=True, useLegacyImplementation=False):
+            if chi == 'R':
+                atom_features_list[idx][1] = 1
+            elif chi == 'S':
+                atom_features_list[idx][1] = 2
+            else:
+                atom_features_list[idx][1] = 3
+        x = np.array(atom_features_list, dtype = np.int16)
+        num_nodes = len(x)
+
+        # bonds
+        num_bond_features = 5  # bond type, bond stereo, local chirality, is_conjugated, rotatable
+        rotate = np.zeros([num_nodes, num_nodes], dtype = np.int16)
+        for i, j in mol.GetSubstructMatches(RotatableBondSmarts):
+            rotate[i, j] = rotate[j, i] = 1
+        if len(mol.GetBonds()) > 0:  # mol has bonds
+            edges_list = []
+            edge_features_list = []
+            chirality_rank = np.zeros(num_nodes, dtype=np.int16)
+            for bond in mol.GetBonds():
+                i = bond.GetBeginAtomIdx()
+                j = bond.GetEndAtomIdx()
+
+                edge_feature = bond_to_feature_vector(bond)
+                chi, chj = 0, 0
+                if x[i, 1] > 0:
+                    chirality_rank[i] += 1
+                    chi += chirality_rank[i]
+                if x[j, 1] > 0:
+                    chirality_rank[j] += 1
+                    chj += chirality_rank[j]
+
+                # add edges in both directions
+                edges_list.append((i, j))
+                edge_features_list.append(edge_feature[:1] + [chj] + edge_feature[1:] + [rotate[i, j]])
+                edges_list.append((j, i))
+                edge_features_list.append(edge_feature[:1] + [chi] + edge_feature[1:] + [rotate[j, i]])
+
+            # data.edge_index: Graph connectivity in COO format with shape [2, num_edges]
+            edge_index = np.array(edges_list, dtype = np.int32).T
+
+            # data.edge_attr: Edge feature matrix with shape [num_edges, num_edge_features]
+            edge_attr = np.array(edge_features_list, dtype = np.int16)
+
+            inverse = np.array([0, 2, 1, 3, 4], dtype=np.int16)
+            for idx, chi in Chem.FindMolChiralCenters(mol, includeCIP=False, includeUnassigned=True, useLegacyImplementation=False):
+                if chi == 'Tet_CW':
+                    edge_attr[edge_index[1] == idx, 1] = inverse[edge_attr[edge_index[1] == idx, 1]]
+        else:  # mol has no bonds
+            edge_index = np.empty((2, 0), dtype = np.int32)
+            edge_attr = np.empty((0, num_bond_features), dtype = np.int16)
+
+        graph = dict()
+        graph['num_nodes'] = num_nodes
+        graph['node_feat'] = x
+        try:
+            graph['node_pos3d'] = mol.GetConformer().GetPositions().astype(np.float16)
+        except:
+            graph['node_pos3d'] = np.zeros([0, 3], dtype=np.float16)
+        graph['edge_index'] = edge_index
+        graph['edge_feat'] = edge_attr
+        return graph 
+
+    def process(self):
+        smiles_list = self.smiles_list
+        homolumogap_list = self.homo_list if (self.homo_list is not None) else ([np.nan] * len(smiles_list))
+        size_dict = len(smiles_list)
+        # homolumogap_list = self.homo_list 
+
+        print('#loaded:', len(smiles_list), len(homolumogap_list))
+        assert len(smiles_list) == len(homolumogap_list)
+
+        print('#converting molecules into graphs...')
+        data_list = []
+        for smiles, homolumogap in tqdm(zip(smiles_list,homolumogap_list), total=size_dict):
+            mol2d = Chem.MolFromSmiles(smiles, params)
+            graph = self.molecule2graph(mol2d)
+            assert(len(graph['edge_feat']) == graph['edge_index'].shape[1])
+            assert(len(graph['node_feat']) == graph['num_nodes'])
+
+            data = Data()
+            data.edge_index = pt.from_numpy(graph['edge_index']).long()
+            data.edge_attr = pt.from_numpy(graph['edge_feat']).int()
+            i2w = np.array([1, 2, 3, 1.5, 0], dtype=np.float32)
+            data.edge_weight = pt.from_numpy(i2w[graph['edge_feat'][:, 0]]).float()
+            data.x = pt.from_numpy(graph['node_feat']).int()
+            data.pos_3d = pt.from_numpy(graph['node_pos3d']).float()
+            addPosRW(data)
+            data.y = pt.Tensor([homolumogap]).float()
+            if self.pre_transform is not None:
+                data = self.pre_transform(data)
+
+            data_list.append(data)
+        print('#converted:', len(data_list), size_dict)
+        assert len(data_list) == size_dict
+
+        # double-check prediction target
+        data, slices = self.collate(data_list)
+
+        print('Saving...')
+        pt.save((data, slices), self.processed_paths[0])
+
+    def get_idx_split(self):
+        split_dict = replace_numpy_with_torchtensor(pt.load(osp.join(self.root, 'split_dict.pt')))
+        return split_dict
 
 if __name__=="__main__":
     print('#atom_cumsize:', *ATOM_CUMSIZE.tolist())
